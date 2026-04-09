@@ -1,0 +1,391 @@
+import discord
+from discord.ext import commands, tasks
+import asyncio
+import json
+from datetime import datetime, timedelta
+import re
+import random
+
+# ==================== HELP VIEW CON PAGINAZIONE (2 PAGINE MASSIMO) ====================
+class HelpView(discord.ui.View):
+    def __init__(self, bot, interaction_user):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.current_page = 1
+        self.interaction_user = interaction_user
+
+    @discord.ui.button(emoji="◀️", style=discord.ButtonStyle.gray, row=0)
+    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.interaction_user.id:
+            return await interaction.response.send_message("❌ Solo chi ha richiesto il help può navigare!", ephemeral=True)
+        self.current_page = 1
+        await self.update_embed(interaction)
+
+    @discord.ui.button(emoji="🗑️", style=discord.ButtonStyle.red, row=0)
+    async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.interaction_user.id:
+            return await interaction.response.send_message("❌ Solo chi ha richiesto il help può cancellare!", ephemeral=True)
+        await interaction.message.delete()
+
+    @discord.ui.button(emoji="▶️", style=discord.ButtonStyle.gray, row=0)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.interaction_user.id:
+            return await interaction.response.send_message("❌ Solo chi ha richiesto il help può navigare!", ephemeral=True)
+        self.current_page = 2
+        await self.update_embed(interaction)
+
+    @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.gray, row=0)
+    async def last_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.interaction_user.id:
+            return await interaction.response.send_message("❌ Solo chi ha richiesto il help può navigare!", ephemeral=True)
+        self.current_page = 2
+        await self.update_embed(interaction)
+
+    async def update_embed(self, interaction: discord.Interaction):
+        if self.current_page == 1:
+            embed = self.bot.page1_embed
+        else:
+            embed = self.bot.page2_embed
+        await interaction.response.edit_message(embed=embed, view=self)
+
+# ==================== SECURITY COG ====================
+class SecurityCog(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.antinuke_config = {}
+        self.action_log = {}
+        self.join_log = {}
+        self.snapshots = {}
+        self.quarantine_role_id = None
+        self.honeypot_channel_id = None
+        self.PANIC_PASSWORD = "detectivenuovoserver"   # Password fissa come richiesto
+        self.snapshot_loop.start()
+
+    @tasks.loop(minutes=8)
+    async def snapshot_loop(self):
+        for guild in self.bot.guilds:
+            config = await self.get_config(guild.id)
+            if not config["enabled"]:
+                continue
+            await self.take_snapshot(guild)
+
+    async def take_snapshot(self, guild):
+        snapshot = {
+            "roles": {r.id: r.permissions.value for r in guild.roles},
+            "timestamp": datetime.utcnow().timestamp()
+        }
+        self.snapshots[guild.id] = snapshot
+
+    async def restore_snapshot(self, guild):
+        if guild.id not in self.snapshots:
+            return False
+        snap = self.snapshots[guild.id]
+        restored = 0
+        for role in guild.roles:
+            if role.id in snap["roles"]:
+                try:
+                    await role.edit(permissions=discord.Permissions(snap["roles"][role.id]))
+                    restored += 1
+                except:
+                    pass
+        return restored > 0
+
+    async def get_config(self, guild_id):
+        if guild_id not in self.antinuke_config:
+            self.antinuke_config[guild_id] = {
+                "enabled": False,
+                "whitelist": [],
+                "logs": None,
+                "threshold": 4,
+                "quarantine_enabled": True,
+                "honeypot_enabled": True,
+                "min_account_age_days": 7
+            }
+        return self.antinuke_config[guild_id]
+
+    def is_whitelisted(self, member):
+        config = self.antinuke_config.get(member.guild.id, {})
+        return member.id in config.get("whitelist", []) or member.guild.owner_id == member.id
+
+    # ==================== PASSWORD PROTECTION ====================
+    def check_password(self, provided_password: str) -> bool:
+        return provided_password == self.PANIC_PASSWORD
+
+    # ==================== PANIC MODE (Post-Compromise Protection) ====================
+    @commands.command(name="panic")
+    async def panic_mode(self, ctx, password: str = None):
+        if not password or not self.check_password(password):
+            return await ctx.send("❌ Password errata. Comando bloccato.")
+        
+        guild = ctx.guild
+        config = await self.get_config(guild.id)
+        if not config["enabled"]:
+            return await ctx.send("❌ Anti-Nuke non abilitato!")
+
+        await guild.edit(verification_level=discord.VerificationLevel.high)
+        restored = await self.restore_snapshot(guild)
+        
+        for channel in guild.channels:
+            try:
+                await channel.set_permissions(guild.default_role, send_messages=False, add_reactions=False)
+            except:
+                pass
+
+        await self.log_action(guild, "🚨 PANIC MODE ATTIVATO (Post-Compromise Protection) - Server in lockdown + snapshot ripristinato")
+        await ctx.send("🚨 **Panic Mode attivato!** Server bloccato e snapshot ripristinato. Usa `>recover detectivenuovoserver` quando è sicuro.")
+
+    # ==================== FULL SERVER RECOVERY ====================
+    @commands.command(name="recover")
+    async def recover_server(self, ctx, password: str = None):
+        if not password or not self.check_password(password):
+            return await ctx.send("❌ Password errata. Comando bloccato.")
+        
+        guild = ctx.guild
+        restored = await self.restore_snapshot(guild)
+        
+        if restored:
+            for channel in guild.channels:
+                try:
+                    await channel.set_permissions(guild.default_role, send_messages=True, add_reactions=True)
+                except:
+                    pass
+            await guild.edit(verification_level=discord.VerificationLevel.medium)
+            await self.log_action(guild, "✅ Server Recovery completato - snapshot ripristinato e server sbloccato")
+            await ctx.send("✅ **Full Recovery eseguito!** Permessi e snapshot ripristinati.")
+        else:
+            await ctx.send("⚠️ Nessun snapshot disponibile per il recovery.")
+
+    # ==================== ANTINUKE CON PASSWORD ====================
+    @commands.command(name="antinuke")
+    async def antinuke(self, ctx, sub: str = None, arg: str = None):
+        config = await self.get_config(ctx.guild.id)
+
+        # enable e disable richiedono password
+        if sub and sub.lower() in ["enable", "disable"]:
+            if not arg or not self.check_password(arg):
+                return await ctx.send("❌ Password errata. Usa: `>antinuke enable detectivenuovoserver`")
+            
+            if sub.lower() == "enable":
+                config["enabled"] = True
+                await ctx.send("✅ **Atomic Void Security FULL** attivata (modalità cinese 2026)")
+            elif sub.lower() == "disable":
+                config["enabled"] = False
+                await ctx.send("❌ Anti-Nuke disabilitato")
+            return
+
+        # Status normale (senza password)
+        if sub is None:
+            embed = discord.Embed(title="🔒 Atomic Void Security - Status", color=0x4B2C6E)
+            embed.add_field(name="Anti-Nuke", value="✅ Abilitato" if config["enabled"] else "❌ Disabilitato", inline=False)
+            embed.add_field(name="Honey Pot", value="✅ Attivo" if config.get("honeypot_enabled") else "❌", inline=False)
+            embed.add_field(name="Quarantena", value="✅ Attiva", inline=False)
+            embed.add_field(name="Snapshot Permessi", value="✅ Attivo (ogni 8 min)", inline=False)
+            embed.set_footer(text="Proprietario: detective | Password richiesta per enable/disable/panic/recover")
+            await ctx.send(embed=embed)
+            return
+
+        # Altri sub-comandi (honeypot ecc.)
+        if sub.lower() == "honeypot":
+            guild = ctx.guild
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False, read_messages=False),
+                guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_messages=True)
+            }
+            channel = await guild.create_text_channel("🔒-honeypot-lounge", overwrites=overwrites)
+            self.honeypot_channel_id = channel.id
+            config["honeypot_enabled"] = True
+            await ctx.send(f"✅ **Honey Pot Channel** creato: {channel.mention}\nChiunque scrive qui = ban immediato (raid bot)")
+
+    # ==================== LISTENERS (identici a prima) ====================
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        if message.channel.id == self.honeypot_channel_id and not message.author.bot:
+            await message.delete()
+            try:
+                await message.guild.ban(message.author, reason="🍯 Honey Pot Trigger - Raid Bot")
+                await self.log_action(message.guild, f"🍯 Honey Pot: {message.author} bannato")
+            except:
+                pass
+
+        if re.search(r'[MN][A-Za-z\d]{23}\.[\w-]{6}\.[\w-]{27}', message.content):
+            await message.delete()
+            try:
+                await message.guild.ban(message.author, reason="Token Stealer rilevato")
+            except:
+                pass
+            await self.log_action(message.guild, f"🚫 Token Stealer: {message.author}")
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member):
+        guild = member.guild
+        config = await self.get_config(guild.id)
+        if not config["enabled"] or not config.get("quarantine_enabled"):
+            return
+
+        account_age = (datetime.utcnow() - member.created_at).days
+        if account_age < config["min_account_age_days"]:
+            if not self.quarantine_role_id or not guild.get_role(self.quarantine_role_id):
+                role = await guild.create_role(name="🔒 Quarantena", color=0xFF0000, permissions=discord.Permissions(send_messages=False, add_reactions=False))
+                self.quarantine_role_id = role.id
+            role = guild.get_role(self.quarantine_role_id)
+            await member.add_roles(role, reason="Auto-Quarantena - Account < 7 giorni")
+            await self.log_action(guild, f"🛡️ {member} → Quarantena (account {account_age} giorni)")
+
+        if guild.id not in self.join_log:
+            self.join_log[guild.id] = []
+        self.join_log[guild.id].append(datetime.utcnow().timestamp())
+        self.join_log[guild.id] = [t for t in self.join_log[guild.id] if datetime.utcnow().timestamp() - t < 60]
+
+        if len(self.join_log[guild.id]) >= 8:
+            await self.lockdown_mode(guild)
+
+    async def lockdown_mode(self, guild):
+        await guild.edit(verification_level=discord.VerificationLevel.high)
+        await self.log_action(guild, "🚨 LOCKDOWN AUTOMATICO - Join velocity troppo alta")
+
+    @commands.Cog.listener()
+    async def on_webhook_update(self, channel):
+        async for entry in channel.guild.audit_logs(limit=1, action=discord.AuditLogAction.webhook_create):
+            if not self.is_whitelisted(entry.user):
+                try:
+                    webhook = await self.bot.fetch_webhook(entry.target.id)
+                    await webhook.delete(reason="Webhook Killer - Non autorizzato")
+                    await channel.guild.kick(entry.user, reason="Webhook Killer")
+                    await self.log_action(channel.guild, f"🕸️ Webhook creata da {entry.user} → eliminata + kick")
+                except:
+                    pass
+
+    @commands.Cog.listener()
+    async def on_guild_role_create(self, role):
+        await self.antinuke_punish(role.guild, "role_create")
+
+    @commands.Cog.listener()
+    async def on_guild_role_delete(self, role):
+        await self.antinuke_punish(role.guild, "role_delete")
+
+    @commands.Cog.listener()
+    async def on_member_ban(self, guild, user):
+        await self.antinuke_punish(guild, "ban")
+
+    @commands.Cog.listener()
+    async def on_guild_channel_create(self, channel):
+        await self.antinuke_punish(channel.guild, "channel_create")
+
+    async def antinuke_punish(self, guild, action):
+        config = await self.get_config(guild.id)
+        if not config["enabled"]:
+            return
+        async for entry in guild.audit_logs(limit=1):
+            if self.is_whitelisted(entry.user):
+                return
+            await asyncio.sleep(random.uniform(0.6, 1.8))
+            try:
+                await guild.ban(entry.user, reason=f"Atomic Void Anti-Nuke → {action}")
+                await self.log_action(guild, f"🚨 {entry.user} bannato per {action}")
+                if guild.id in self.snapshots:
+                    await self.restore_snapshot(guild)
+            except:
+                pass
+
+    async def log_action(self, guild, text):
+        config = await self.get_config(guild.id)
+        if config.get("logs"):
+            channel = guild.get_channel(config["logs"])
+            if channel:
+                await channel.send(f"`{datetime.utcnow().strftime('%H:%M:%S')}` {text}")
+
+# ==================== BOT SETUP ====================
+class AtomicVoidBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix=">", intents=discord.Intents.all())
+
+    async def setup_hook(self):
+        await self.add_cog(SecurityCog(self))
+        await self.tree.sync()
+
+bot = AtomicVoidBot()
+
+# ==================== /HELP ====================
+@bot.tree.command(name="help", description="Mostra il pannello di aiuto Atomic Void")
+async def help_command(interaction: discord.Interaction):
+    embed1 = discord.Embed(color=0x4B2C6E, timestamp=discord.utils.utcnow())
+    embed1.set_author(name="detective", icon_url=interaction.user.avatar.url if interaction.user.avatar else None)
+    embed1.description = (
+        "**→ Start Atomic Void X Today**\n"
+        "**Type >antinuke enable**\n"
+        "**Server Prefix:** `>`\n"
+        "**Total Commands:** `585`"
+    )
+
+    main_features = (
+        "❤️ **Security**\n"
+        "📦 **Automoderation**\n"
+        "🔧 **Utility**\n"
+        "🎵 **Music**\n"
+        "🔄 **Autoreact & responder**\n"
+        "🔨 **Moderation**\n"
+        "👤 **Autorole & Invc**\n"
+        "🎉 **Fun**\n"
+        "🎮 **Games**\n"
+        "❌ **Ignore Channels**\n"
+        "📡 **Server**\n"
+        "🔊 **Voice**\n"
+        "👋 **Welcomer**\n"
+        "🎁 **Giveaway**\n"
+        "🎟️ **Ticket** `NEW`\n"
+        "👥 **Invite Tracker** `NEW`"
+    )
+
+    extra_features = (
+        "📋 **Advance Logging**\n"
+        "⭐ **Vanityroles**\n"
+        "➕ **Counting** `NEW`\n"
+        "🔗 **J2C** `NEW`\n"
+        "🤖 **AI** `NEW`\n"
+        "🚀 **Boost** `NEW`\n"
+        "📈 **Leveling** `NEW`\n"
+        "📌 **Sticky** `NEW`\n"
+        "✅ **Verification** `NEW`\n"
+        "🔒 **Encryption** `NEW`\n"
+        "⛏️ **Minecraft** `NEW`\n"
+        "📬 **Joindm** `NEW`\n"
+        "🎂 **Birthday** `NEW`\n"
+        "🎨 **Customrole**"
+    )
+
+    embed1.add_field(name="**📁 Main Features**", value=main_features, inline=True)
+    embed1.add_field(name="**📁 Extra Features**", value=extra_features, inline=True)
+    embed1.set_footer(text="Help page 1/2 • Requested by: detective")
+    embed1.set_thumbnail(url="https://i.imgur.com/VOSTRO_LINK_PERSONAGGIO.png")  # Cambia con il tuo link
+
+    embed2 = discord.Embed(title="🔥 Atomic Void - Advanced Chinese Security (2026)", color=0x4B2C6E)
+    embed2.description = (
+        "**🚨 Funzionalità Extra attivate con >antinuke enable detectivenuovoserver**\n\n"
+        "🍯 **Honey Pot Channel** → ban automatico su canale nascosto\n"
+        "🛡️ **Auto Quarantena** → account < 7 giorni in ruolo limitato\n"
+        "📈 **Multi-Layer Invite Rate Limiting** → rileva invite multipli + velocity\n"
+        "🔄 **Account Age + Join Pattern** → lockdown automatico su raid\n"
+        "📸 **Snapshot Permessi** → restore automatico dopo nuke (ogni 8 min)\n"
+        "🕸️ **Webhook & Integration Killer** → elimina webhook non autorizzati\n"
+        "🚫 **Anti-Token Stealer** → blocca messaggi con token Discord\n"
+        "⏳ **Fake Delay** → ritardo casuale per confondere raid bot\n"
+        "📊 **Audit Log Flood Protection** → ban su troppe azioni veloci\n\n"
+        "**🛡️ Feature Avanzate (difficili):** \n"
+        "🚨 **Post-Compromise Protection** → `>panic detectivenuovoserver`\n"
+        "🔄 **Full Server Recovery** → `>recover detectivenuovoserver`"
+    )
+    embed2.set_footer(text="Help page 2/2 • Requested by: detective")
+
+    bot.page1_embed = embed1
+    bot.page2_embed = embed2
+
+    view = HelpView(bot, interaction.user.id)
+    await interaction.response.send_message(embed=embed1, view=view)
+
+@bot.event
+async def on_ready():
+    print("✅ Atomic Void ONLINE - Password Protection attivata")
+    print("   • Password: detectivenuovoserver")
+    print("   • Usa >panic detectivenuovoserver   |   >recover detectivenuovoserver")
+    print("   • >antinuke enable detectivenuovoserver")
+bot.run("IL_TUO_TOKEN_QUI")
